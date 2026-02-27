@@ -6,9 +6,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
 local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local Rayfield
+local CONFIG_DIR = "GardenHorizon"
+local CONFIG_FILE = CONFIG_DIR .. "/hub_state_v1.json"
+local unpackArgs = table.unpack or unpack
 
 local Remotes = ReplicatedStorage:WaitForChild("RemoteEvents")
 local RF_SellItems = Remotes:WaitForChild("SellItems")
@@ -20,6 +24,7 @@ local RE_UseGear = Remotes:WaitForChild("UseGear")
 local RE_RequestQuests = Remotes:WaitForChild("RequestQuests")
 local RE_UpdateQuests = Remotes:WaitForChild("UpdateQuests")
 local RE_ClaimQuest = Remotes:WaitForChild("ClaimQuest")
+local RE_PurchaseQuestRefresh = Remotes:WaitForChild("PurchaseSingleRefresh")
 local RE_UnseatPlayer = Remotes:WaitForChild("UnseatPlayer")
 
 local ItemInventory = require(ReplicatedStorage:WaitForChild("Inventory"):WaitForChild("ItemInventory"))
@@ -29,8 +34,9 @@ local PlantData = require(ReplicatedStorage:WaitForChild("Plants"):WaitForChild(
 local FruitValueCalculator = require(ReplicatedStorage:WaitForChild("Economy"):WaitForChild("FruitValueCalculator"))
 
 local function safeInvoke(remote, ...)
+    local args = table.pack(...)
     local ok, result = pcall(function()
-        return remote:InvokeServer(...)
+        return remote:InvokeServer(unpackArgs(args, 1, args.n))
     end)
     if ok then
         return result
@@ -39,9 +45,24 @@ local function safeInvoke(remote, ...)
 end
 
 local function safeFire(remote, ...)
+    local args = table.pack(...)
     pcall(function()
-        remote:FireServer(...)
+        remote:FireServer(unpackArgs(args, 1, args.n))
     end)
+end
+
+local function canUseFileApi()
+    return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+end
+
+local function safeNotify(title, content, duration)
+    if Rayfield and Rayfield.Notify then
+        Rayfield:Notify({
+            Title = title,
+            Content = content,
+            Duration = duration or 4
+        })
+    end
 end
 
 local function findToolByName(name)
@@ -146,6 +167,15 @@ local function teleportToSeeds()
     local map = workspace:FindFirstChild("MapPhysical")
     local teleports = map and map:FindFirstChild("Teleports")
     local part = teleports and teleports:FindFirstChild("SeedsTeleport")
+    if part then
+        teleportToPart(part, 3)
+    end
+end
+
+local function teleportToGears()
+    local map = workspace:FindFirstChild("MapPhysical")
+    local teleports = map and map:FindFirstChild("Teleports")
+    local part = teleports and (teleports:FindFirstChild("GearTeleport") or teleports:FindFirstChild("GearsTeleport") or teleports:FindFirstChild("SeedsTeleport"))
     if part then
         teleportToPart(part, 3)
     end
@@ -284,6 +314,48 @@ local function buildPlantPositions(spacing)
     return positions
 end
 
+local function getPlayerPlantPosition()
+    local root = getRoot()
+    if not root then
+        return nil
+    end
+
+    local plantableParts = getPlantableParts()
+    if #plantableParts == 0 then
+        return nil
+    end
+
+    local rootPos = root.Position
+
+    for _, part in ipairs(plantableParts) do
+        local localPos = part.CFrame:PointToObjectSpace(rootPos)
+        local halfX = part.Size.X * 0.5
+        local halfZ = part.Size.Z * 0.5
+        if math.abs(localPos.X) <= halfX and math.abs(localPos.Z) <= halfZ then
+            local surfaceLocal = Vector3.new(
+                math.clamp(localPos.X, -halfX, halfX),
+                part.Size.Y * 0.5,
+                math.clamp(localPos.Z, -halfZ, halfZ)
+            )
+            return part.CFrame:PointToWorldSpace(surfaceLocal)
+        end
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = { LocalPlayer.Character }
+    local hit = workspace:Raycast(rootPos + Vector3.new(0, 2, 0), Vector3.new(0, -20, 0), rayParams)
+    if hit then
+        for _, part in ipairs(plantableParts) do
+            if hit.Instance == part then
+                return hit.Position
+            end
+        end
+    end
+
+    return nil
+end
+
 local function getHarvestData(prompt)
     if not (prompt and prompt.Parent) then
         return nil, nil
@@ -369,6 +441,105 @@ local function getMutationAny(model)
     return nil
 end
 
+local function isHarvestItem(tool)
+    if tool:GetAttribute("IsHarvested") then
+        return true
+    end
+    if tool:GetAttribute("HarvestedFrom") then
+        return true
+    end
+    if tool:GetAttribute("FruitValue") then
+        return true
+    end
+    return false
+end
+
+local function getToolBaseName(tool)
+    local harvested = tool:GetAttribute("HarvestedFrom")
+    if harvested then
+        return harvested
+    end
+    local base = tool:GetAttribute("BaseName") or tool.Name
+    base = tostring(base)
+    base = base:gsub("^x%d+%s+", "")
+    return base
+end
+
+local function buildToolCounts()
+    local counts = {}
+    local function addTool(tool)
+        if tool:IsA("Tool") and isHarvestItem(tool) then
+            local base = getToolBaseName(tool)
+            if base and base ~= "" then
+                counts[base] = (counts[base] or 0) + (tool:GetAttribute("ItemCount") or 1)
+            end
+        end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            addTool(tool)
+        end
+    end
+    local char = LocalPlayer.Character
+    if char then
+        for _, tool in ipairs(char:GetChildren()) do
+            addTool(tool)
+        end
+    end
+    return counts
+end
+
+local function collectTools()
+    local list = {}
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                table.insert(list, tool)
+            end
+        end
+    end
+    local char = LocalPlayer.Character
+    if char then
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") then
+                table.insert(list, tool)
+            end
+        end
+    end
+    return list
+end
+
+local function getKeepLimit(base)
+    if state.keepList and #state.keepList > 0 then
+        for _, name in ipairs(state.keepList) do
+            if name == base then
+                return state.keepAmountSelected or 0
+            end
+        end
+    end
+    return state.keepAmountOthers or 0
+end
+
+local function countSpecialPlants()
+    local mutationCount = 0
+    local giantCount = 0
+    for _, plant in ipairs(CollectionService:GetTagged("Plant")) do
+        if plant:IsA("Model") and plant:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+            if plant:GetAttribute("FullyGrown") then
+                if getMutationAny(plant) then
+                    mutationCount = mutationCount + 1
+                end
+                if plant:GetAttribute("IsGiant") then
+                    giantCount = giantCount + 1
+                end
+            end
+        end
+    end
+    return mutationCount, giantCount
+end
+
 local function getFavoriteTarget(model)
     if not model then
         return nil, nil
@@ -406,7 +577,15 @@ for plantType, data in pairs(SeedShopData) do
     plantTypeToShopName[plantType] = name
     seedShopPrices[name] = data.Price or 0
 end
-table.sort(seedShopItems)
+table.sort(seedShopItems, function(a, b)
+    if a == "Carrot" then
+        return true
+    end
+    if b == "Carrot" then
+        return false
+    end
+    return a < b
+end)
 
 local gearShopItems = {}
 local gearShopPrices = {}
@@ -430,6 +609,11 @@ local state = {
     autoSellValue = false,
     sellValueMin = 0,
     sellValueInterval = 1,
+    autoSellKeep = false,
+    keepList = {},
+    keepAmountSelected = 0,
+    keepAmountOthers = 0,
+    keepInterval = 1.5,
 
     autoHarvest = false,
     harvestInterval = 0.4,
@@ -437,6 +621,8 @@ local state = {
     mutationFilter = "All",
     skipFavorited = true,
     inventoryLimit = 300,
+    harvestOnlyListEnabled = false,
+    harvestOnlyList = {},
 
     autoHarvestBell = false,
     harvestBellInterval = 1.5,
@@ -447,11 +633,18 @@ local state = {
     favoriteMutations = true,
     favoriteGiants = true,
     favoriteInterval = 2,
+    alertSpecial = false,
+    alertNotify = false,
+    alertInterval = 5,
+    lastMutationCount = 0,
+    lastGiantCount = 0,
 
     autoPlant = false,
     plantType = plantTypes[1] or "Carrot",
     plantInterval = 0.4,
     plantSpacing = 3,
+    plantAtPlayerPosition = true,
+    autoTeleportGardenForPlant = true,
     useEquippedSeed = false,
     autoBuyPlantSeed = false,
     autoRefreshGrid = false,
@@ -467,9 +660,14 @@ local state = {
     autoBuyAllGears = false,
     autoBuyGear = false,
     selectedGearShopItem = gearShopItems[1],
-    buyDelay = 0.2,
-    buyInterval = 15,
+    buyDelay = 0.25,
+    buyInterval = 0.25,
     minShillingsToBuy = 0,
+    buyFromAnywhere = true,
+    autoTeleportSeedShop = false,
+    autoTeleportGearShop = false,
+    autoTeleportSellShop = true,
+    teleportCooldown = 1.5,
 
     autoMerge = false,
     mergeInterval = 10,
@@ -479,24 +677,47 @@ local state = {
     claimInterval = 60,
 
     restockNotify = true,
+    autoSprinkler = false,
+    sprinklerType = "Basic Sprinkler",
+    sprinklerInterval = 5,
+    sprinklerSpacing = 12,
+    sprinklerMax = 6,
+    sprinklerAutoTeleport = true,
 
     autoQuest = false,
     questDaily = true,
     questWeekly = true,
+    questPriority = "DailyFirst",
+    questLastCategory = "Weekly",
     questAllowSell = false,
     questAutoTeleport = true,
     questInterval = 5,
     questPlantInterval = 0.4,
     questHarvestInterval = 0.4,
     questBuyInterval = 5,
+    questClaimInterval = 1.5,
     questTargetType = nil,
     questTargetItem = nil,
     questTargetCategory = nil,
     questTargetSlot = nil,
-    questNotifySell = true
+    questNotifySell = true,
+    questRestockPin = true,
+    questRefresh = false,
+    questRefreshMaxPrice = 50000,
+    questRefreshMinShillings = 0,
+
+    autoSaveConfig = false,
+    autoSaveInterval = 15
 }
 
 local antiAfkConnection = nil
+local canBuy
+local getShopItemForPlantType
+local ensureTeleported
+local purchaseSeedShopItem
+local purchaseGearShopItem
+local performSell
+
 local function setAntiAfk(enabled)
     state.antiAfk = enabled
     if enabled then
@@ -541,10 +762,149 @@ local function setRestockNotify(enabled)
     end))
 end
 
+local questRestockConnection = nil
+local function setQuestRestockPin(enabled)
+    state.questRestockPin = enabled
+    if questRestockConnection then
+        questRestockConnection:Disconnect()
+        questRestockConnection = nil
+    end
+    if not enabled then
+        return
+    end
+    questRestockConnection = workspace:GetAttributeChangedSignal("SeedShop"):Connect(function()
+        if state.autoQuest and state.questTargetType == "PlantSeeds" and state.questTargetItem then
+            if type(getShopItemForPlantType) ~= "function" or type(purchaseSeedShopItem) ~= "function" then
+                return
+            end
+            local shopItem = getShopItemForPlantType(state.questTargetItem)
+            if shopItem then
+                if state.questAutoTeleport and type(ensureTeleported) == "function" then
+                    ensureTeleported("seed")
+                end
+                purchaseSeedShopItem(shopItem)
+            end
+        end
+    end)
+end
+
+local nonPersistentState = {
+    running = true,
+    questTargetType = true,
+    questTargetItem = true,
+    questTargetCategory = true,
+    questTargetSlot = true,
+    lastMutationCount = true,
+    lastGiantCount = true
+}
+
+local function saveConfig()
+    if not canUseFileApi() then
+        return false, "File API unavailable in this executor."
+    end
+
+    local payload = {}
+    for key, value in pairs(state) do
+        if not nonPersistentState[key] then
+            local valueType = type(value)
+            if valueType == "boolean" or valueType == "number" or valueType == "string" then
+                payload[key] = value
+            elseif valueType == "table" then
+                local arr = {}
+                local serializable = true
+                for _, item in ipairs(value) do
+                    local itemType = type(item)
+                    if itemType == "boolean" or itemType == "number" or itemType == "string" then
+                        table.insert(arr, item)
+                    else
+                        serializable = false
+                        break
+                    end
+                end
+                if serializable then
+                    payload[key] = arr
+                end
+            end
+        end
+    end
+
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        if not isfolder(CONFIG_DIR) then
+            pcall(makefolder, CONFIG_DIR)
+        end
+    end
+
+    local ok, err = pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(payload))
+    end)
+    if not ok then
+        return false, tostring(err)
+    end
+    return true
+end
+
+local function applyConfig(data)
+    if type(data) ~= "table" then
+        return
+    end
+
+    for key, saved in pairs(data) do
+        local current = state[key]
+        if current ~= nil then
+            if type(current) == type(saved) and type(saved) ~= "table" then
+                state[key] = saved
+            elseif type(current) == "table" and type(saved) == "table" then
+                local arr = {}
+                for _, item in ipairs(saved) do
+                    table.insert(arr, item)
+                end
+                state[key] = arr
+            end
+        end
+    end
+
+    setAntiAfk(state.antiAfk)
+    setRestockNotify(state.restockNotify)
+    setQuestRestockPin(state.questRestockPin)
+
+    if state.buyFromAnywhere then
+        state.autoTeleportSeedShop = false
+        state.autoTeleportGearShop = false
+    end
+end
+
+local function loadConfig()
+    if not canUseFileApi() then
+        return false, "File API unavailable in this executor."
+    end
+    if not isfile(CONFIG_FILE) then
+        return false, "Config file not found."
+    end
+
+    local raw
+    local okRead, readErr = pcall(function()
+        raw = readfile(CONFIG_FILE)
+    end)
+    if not okRead then
+        return false, tostring(readErr)
+    end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not okDecode then
+        return false, "Failed to decode config JSON."
+    end
+
+    applyConfig(decoded)
+    return true
+end
+
 local function stopAll()
     state.running = false
     state.autoSell = false
     state.autoSellValue = false
+    state.autoSellKeep = false
     state.autoHarvest = false
     state.autoHarvestBell = false
     state.autoFavorite = false
@@ -557,12 +917,17 @@ local function stopAll()
     state.autoBuyPlantSeed = false
     state.autoRefreshGrid = false
     state.autoClaimCash = false
+    state.autoSprinkler = false
+    state.alertSpecial = false
     state.autoQuest = false
+    state.questRefresh = false
+    state.autoSaveConfig = false
     setAntiAfk(false)
     setRestockNotify(false)
+    setQuestRestockPin(false)
 end
 
-local function canBuy(required)
+canBuy = function(required)
     local minKeep = state.minShillingsToBuy or 0
     local cash = getShillings()
     if cash < minKeep then
@@ -574,12 +939,88 @@ local function canBuy(required)
     return true
 end
 
+local lastTeleportAt = {
+    seed = 0,
+    gear = 0,
+    sell = 0,
+    garden = 0
+}
+
+ensureTeleported = function(kind)
+    local now = os.clock()
+    local cooldown = math.max(0.1, state.teleportCooldown or 1.5)
+    local last = lastTeleportAt[kind] or 0
+    if now - last < cooldown then
+        return
+    end
+
+    if kind == "seed" and state.autoTeleportSeedShop then
+        teleportToSeeds()
+        lastTeleportAt[kind] = now
+    elseif kind == "gear" and state.autoTeleportGearShop then
+        teleportToGears()
+        lastTeleportAt[kind] = now
+    elseif kind == "sell" and state.autoTeleportSellShop then
+        teleportToSell()
+        lastTeleportAt[kind] = now
+    elseif kind == "garden" then
+        teleportToGarden()
+        lastTeleportAt[kind] = now
+    end
+end
+
+purchaseSeedShopItem = function(itemName)
+    if not itemName then
+        return nil
+    end
+    local price = seedShopPrices[itemName]
+    if not canBuy(price) then
+        return nil
+    end
+
+    if state.buyFromAnywhere then
+        return safeInvoke(RF_PurchaseShopItem, "SeedShop", itemName)
+    end
+
+    ensureTeleported("seed")
+    return safeInvoke(RF_PurchaseShopItem, "SeedShop", itemName)
+end
+
+purchaseGearShopItem = function(itemName)
+    if not itemName then
+        return nil
+    end
+    local price = gearShopPrices[itemName]
+    if not canBuy(price) then
+        return nil
+    end
+
+    if state.buyFromAnywhere then
+        return safeInvoke(RF_PurchaseShopItem, "GearShop", itemName)
+    end
+
+    ensureTeleported("gear")
+    return safeInvoke(RF_PurchaseShopItem, "GearShop", itemName)
+end
+
+performSell = function(mode)
+    ensureTeleported("sell")
+    return safeInvoke(RF_SellItems, mode or "SellAll")
+end
+
 local plantPositions = {}
 local plantIndex = 1
+local sprinklerPositions = {}
+local sprinklerIndex = 1
 
 local function refreshPlantPositions()
     plantPositions = buildPlantPositions(state.plantSpacing)
     plantIndex = 1
+end
+
+local function refreshSprinklerPositions()
+    sprinklerPositions = buildPlantPositions(state.sprinklerSpacing)
+    sprinklerIndex = 1
 end
 
 local function nextPlantPosition()
@@ -591,6 +1032,47 @@ local function nextPlantPosition()
     end
     local pos = plantPositions[plantIndex]
     plantIndex = plantIndex + 1
+    return pos
+end
+
+local function getNextAutoPlantPosition(allowGardenTeleport)
+    local shouldTeleportGarden = allowGardenTeleport == true
+
+    if state.plantAtPlayerPosition then
+        local playerPos = getPlayerPlantPosition()
+        if playerPos then
+            return playerPos
+        end
+
+        if shouldTeleportGarden then
+            ensureTeleported("garden")
+            task.wait(0.05)
+            playerPos = getPlayerPlantPosition()
+            if playerPos then
+                return playerPos
+            end
+        end
+    end
+
+    if shouldTeleportGarden then
+        ensureTeleported("garden")
+    end
+
+    if #plantPositions == 0 then
+        refreshPlantPositions()
+    end
+    return nextPlantPosition()
+end
+
+local function nextSprinklerPosition()
+    if #sprinklerPositions == 0 then
+        return nil
+    end
+    if sprinklerIndex > #sprinklerPositions then
+        sprinklerIndex = 1
+    end
+    local pos = sprinklerPositions[sprinklerIndex]
+    sprinklerIndex = sprinklerIndex + 1
     return pos
 end
 
@@ -621,7 +1103,7 @@ local function hasSeedForPlantType(plantType)
     return ItemInventory.getItemCount(tool) > 0
 end
 
-local function getShopItemForPlantType(plantType)
+getShopItemForPlantType = function(plantType)
     return plantTypeToShopName[plantType]
 end
 
@@ -662,10 +1144,26 @@ local function collectHarvestTargets(filterPlantType)
             if data and model then
                 if isOwned(model) and (not state.skipFavorited or not isFavorited(model)) then
                     local plantType = getPlantTypeForModel(model)
+                    local allowed = true
+
                     if filterPlantType and plantType ~= filterPlantType then
-                        goto continue
+                        allowed = false
                     end
-                    if shouldHarvestByMutation(model) then
+
+                    if allowed and (not filterPlantType) then
+                        if state.harvestOnlyListEnabled and state.harvestOnlyList and #state.harvestOnlyList > 0 then
+                            local inList = false
+                            for _, name in ipairs(state.harvestOnlyList) do
+                                if name == plantType then
+                                    inList = true
+                                    break
+                                end
+                            end
+                            allowed = inList
+                        end
+                    end
+
+                    if allowed and shouldHarvestByMutation(model) then
                         table.insert(list, data)
                         if #list >= state.harvestBatch then
                             break
@@ -674,49 +1172,50 @@ local function collectHarvestTargets(filterPlantType)
                 end
             end
         end
-        ::continue::
     end
     return list
 end
 
-local function buyAllSeedsOnce()
-    for _, itemName in ipairs(seedShopItems) do
-        local price = seedShopPrices[itemName]
-        if canBuy(price) then
-            safeInvoke(RF_PurchaseShopItem, "SeedShop", itemName)
-            task.wait(state.buyDelay)
-        end
+local seedBuyIndex = 1
+local gearBuyIndex = 1
+
+local function buyNextSeedInOrder()
+    if #seedShopItems == 0 then
+        return
     end
+    if seedBuyIndex > #seedShopItems then
+        seedBuyIndex = 1
+    end
+    purchaseSeedShopItem(seedShopItems[seedBuyIndex])
+    seedBuyIndex = seedBuyIndex + 1
 end
 
-local function buyAllGearsOnce()
-    for _, itemName in ipairs(gearShopItems) do
-        local price = gearShopPrices[itemName]
-        if canBuy(price) then
-            safeInvoke(RF_PurchaseShopItem, "GearShop", itemName)
-            task.wait(state.buyDelay)
-        end
+local function buyNextGearInOrder()
+    if #gearShopItems == 0 then
+        return
     end
+    if gearBuyIndex > #gearShopItems then
+        gearBuyIndex = 1
+    end
+    purchaseGearShopItem(gearShopItems[gearBuyIndex])
+    gearBuyIndex = gearBuyIndex + 1
 end
 
 local function buySelectedSeedOnce()
     if state.selectedSeedShopItem then
-        local price = seedShopPrices[state.selectedSeedShopItem]
-        if canBuy(price) then
-            safeInvoke(RF_PurchaseShopItem, "SeedShop", state.selectedSeedShopItem)
-        end
+        purchaseSeedShopItem(state.selectedSeedShopItem)
     end
 end
 
 local function buySelectedGearOnce()
     if state.selectedGearShopItem then
-        local price = gearShopPrices[state.selectedGearShopItem]
-        if canBuy(price) then
-            safeInvoke(RF_PurchaseShopItem, "GearShop", state.selectedGearShopItem)
-        end
+        purchaseGearShopItem(state.selectedGearShopItem)
     end
 end
 
+loadConfig()
+refreshPlantPositions()
+refreshSprinklerPositions()
 setAntiAfk(state.antiAfk)
 
 local function findHarvestBellTarget()
@@ -748,6 +1247,16 @@ local function findHarvestBellTarget()
         end
     end
     return bestUuid
+end
+
+local function countSprinklers()
+    local count = 0
+    for _, spr in ipairs(CollectionService:GetTagged("Sprinkler")) do
+        if spr:IsA("Model") and spr:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+            count = count + 1
+        end
+    end
+    return count
 end
 
 local function findFavoriteTarget()
@@ -828,14 +1337,57 @@ local function getQuestEntries(category)
     return info.Active
 end
 
-local function pickQuestTarget()
+local function buildQuestCategoryOrder()
     local categories = {}
-    if state.questDaily then
-        table.insert(categories, "Daily")
+    local daily = state.questDaily
+    local weekly = state.questWeekly
+    if not daily and not weekly then
+        return categories
     end
-    if state.questWeekly then
-        table.insert(categories, "Weekly")
+    if state.questPriority == "WeeklyFirst" then
+        if weekly then
+            table.insert(categories, "Weekly")
+        end
+        if daily then
+            table.insert(categories, "Daily")
+        end
+    elseif state.questPriority == "RoundRobin" then
+        if daily and weekly then
+            local first = state.questLastCategory == "Daily" and "Weekly" or "Daily"
+            table.insert(categories, first)
+            table.insert(categories, first == "Daily" and "Weekly" or "Daily")
+        elseif daily then
+            table.insert(categories, "Daily")
+        elseif weekly then
+            table.insert(categories, "Weekly")
+        end
+    else
+        if daily then
+            table.insert(categories, "Daily")
+        end
+        if weekly then
+            table.insert(categories, "Weekly")
+        end
     end
+    return categories
+end
+
+local function questSupported(quest)
+    if not quest or not quest.Type then
+        return false
+    end
+    if quest.Type == "PlantSeeds" or quest.Type == "HarvestCrops" or quest.Type == "GainShillings" then
+        return true
+    end
+    return false
+end
+
+local function questSeedInShop(item)
+    return item and SeedShopData[item] ~= nil
+end
+
+local function pickQuestTarget()
+    local categories = buildQuestCategoryOrder()
     for _, category in ipairs(categories) do
         local active = getQuestEntries(category)
         if active then
@@ -845,6 +1397,7 @@ local function pickQuestTarget()
                     if quest.Progress >= quest.Goal then
                         claimQuest(category, i)
                     else
+                        state.questLastCategory = category
                         return category, i, quest
                     end
                 end
@@ -853,6 +1406,38 @@ local function pickQuestTarget()
     end
     return nil, nil, nil
 end
+
+local function getQuestRefreshPrice(category, resetCount)
+    local base = category == "Weekly" and 350000 or 50000
+    return base * ((resetCount or 0) + 1)
+end
+
+local function claimCompletedQuests()
+    if not questData then
+        return
+    end
+
+    local categories = {}
+    if state.questDaily then
+        table.insert(categories, "Daily")
+    end
+    if state.questWeekly then
+        table.insert(categories, "Weekly")
+    end
+
+    for _, category in ipairs(categories) do
+        local active = getQuestEntries(category)
+        if active then
+            for i = 1, 5 do
+                local quest = active[tostring(i)]
+                if quest and not quest.Claimed and quest.Progress and quest.Goal and quest.Progress >= quest.Goal then
+                    claimQuest(category, i)
+                end
+            end
+        end
+    end
+end
+
 
 Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
@@ -875,12 +1460,13 @@ local TeleportTab = Window:CreateTab("Teleport")
 local SettingsTab = Window:CreateTab("Settings")
 
 setRestockNotify(state.restockNotify)
+setQuestRestockPin(state.questRestockPin)
 
 FarmingTab:CreateSection("Harvest")
 
 FarmingTab:CreateToggle({
     Name = "Auto Harvest",
-    CurrentValue = false,
+    CurrentValue = state.autoHarvest,
     Callback = function(value)
         state.autoHarvest = value
     end
@@ -889,7 +1475,7 @@ FarmingTab:CreateToggle({
 FarmingTab:CreateDropdown({
     Name = "Mutation Filter",
     Options = { "All", "Only Mutated", "Only Non-Mutated" },
-    CurrentOption = "All",
+    CurrentOption = state.mutationFilter,
     MultipleOptions = false,
     Callback = function(option)
         state.mutationFilter = option
@@ -897,8 +1483,26 @@ FarmingTab:CreateDropdown({
 })
 
 FarmingTab:CreateToggle({
+    Name = "Harvest Only Selected Crops",
+    CurrentValue = state.harvestOnlyListEnabled,
+    Callback = function(value)
+        state.harvestOnlyListEnabled = value
+    end
+})
+
+FarmingTab:CreateDropdown({
+    Name = "Harvest Crop List",
+    Options = plantTypes,
+    CurrentOption = state.harvestOnlyList,
+    MultipleOptions = true,
+    Callback = function(options)
+        state.harvestOnlyList = options
+    end
+})
+
+FarmingTab:CreateToggle({
     Name = "Skip Favorited",
-    CurrentValue = true,
+    CurrentValue = state.skipFavorited,
     Callback = function(value)
         state.skipFavorited = value
     end
@@ -941,7 +1545,7 @@ FarmingTab:CreateSection("Harvest Bell")
 
 FarmingTab:CreateToggle({
     Name = "Auto Harvest Bell",
-    CurrentValue = false,
+    CurrentValue = state.autoHarvestBell,
     Callback = function(value)
         state.autoHarvestBell = value
     end
@@ -949,7 +1553,7 @@ FarmingTab:CreateToggle({
 
 FarmingTab:CreateToggle({
     Name = "Skip Favorited (Bell)",
-    CurrentValue = true,
+    CurrentValue = state.harvestBellSkipFavorited,
     Callback = function(value)
         state.harvestBellSkipFavorited = value
     end
@@ -981,7 +1585,7 @@ FarmingTab:CreateSection("Auto Favorite")
 
 FarmingTab:CreateToggle({
     Name = "Auto Favorite",
-    CurrentValue = false,
+    CurrentValue = state.autoFavorite,
     Callback = function(value)
         state.autoFavorite = value
     end
@@ -1018,7 +1622,7 @@ FarmingTab:CreateSection("Planting")
 
 FarmingTab:CreateToggle({
     Name = "Auto Plant",
-    CurrentValue = false,
+    CurrentValue = state.autoPlant,
     Callback = function(value)
         state.autoPlant = value
         if value then
@@ -1028,8 +1632,16 @@ FarmingTab:CreateToggle({
 })
 
 FarmingTab:CreateToggle({
+    Name = "Plant At Player Position",
+    CurrentValue = state.plantAtPlayerPosition,
+    Callback = function(value)
+        state.plantAtPlayerPosition = value
+    end
+})
+
+FarmingTab:CreateToggle({
     Name = "Use Equipped Seed",
-    CurrentValue = false,
+    CurrentValue = state.useEquippedSeed,
     Callback = function(value)
         state.useEquippedSeed = value
     end
@@ -1037,9 +1649,17 @@ FarmingTab:CreateToggle({
 
 FarmingTab:CreateToggle({
     Name = "Auto Buy Needed Seed (Auto Plant)",
-    CurrentValue = false,
+    CurrentValue = state.autoBuyPlantSeed,
     Callback = function(value)
         state.autoBuyPlantSeed = value
+    end
+})
+
+FarmingTab:CreateToggle({
+    Name = "Auto Teleport Back To Garden (Plant)",
+    CurrentValue = state.autoTeleportGardenForPlant,
+    Callback = function(value)
+        state.autoTeleportGardenForPlant = value
     end
 })
 
@@ -1055,7 +1675,7 @@ FarmingTab:CreateDropdown({
 
 FarmingTab:CreateToggle({
     Name = "Plant Rotation",
-    CurrentValue = false,
+    CurrentValue = state.plantRotation,
     Callback = function(value)
         state.plantRotation = value
     end
@@ -1064,7 +1684,7 @@ FarmingTab:CreateToggle({
 FarmingTab:CreateDropdown({
     Name = "Rotation Types",
     Options = plantTypes,
-    CurrentOption = {},
+    CurrentOption = state.rotationList,
     MultipleOptions = true,
     Callback = function(options)
         state.rotationList = options
@@ -1108,7 +1728,7 @@ FarmingTab:CreateSlider({
 
 FarmingTab:CreateToggle({
     Name = "Auto Refresh Plant Grid",
-    CurrentValue = false,
+    CurrentValue = state.autoRefreshGrid,
     Callback = function(value)
         state.autoRefreshGrid = value
     end
@@ -1132,11 +1752,76 @@ FarmingTab:CreateButton({
     end
 })
 
+FarmingTab:CreateSection("Sprinklers")
+
+FarmingTab:CreateToggle({
+    Name = "Auto Place Sprinklers",
+    CurrentValue = state.autoSprinkler,
+    Callback = function(value)
+        state.autoSprinkler = value
+        if value then
+            refreshSprinklerPositions()
+        end
+    end
+})
+
+FarmingTab:CreateDropdown({
+    Name = "Sprinkler Type",
+    Options = { "Basic Sprinkler", "Turbo Sprinkler", "Super Sprinkler" },
+    CurrentOption = state.sprinklerType,
+    MultipleOptions = false,
+    Callback = function(option)
+        state.sprinklerType = option
+    end
+})
+
+FarmingTab:CreateToggle({
+    Name = "Auto Teleport For Sprinklers",
+    CurrentValue = state.sprinklerAutoTeleport,
+    Callback = function(value)
+        state.sprinklerAutoTeleport = value
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Sprinkler Spacing",
+    Range = { 6, 20 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = state.sprinklerSpacing,
+    Callback = function(value)
+        state.sprinklerSpacing = value
+        refreshSprinklerPositions()
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Sprinkler Max Count",
+    Range = { 1, 20 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = state.sprinklerMax,
+    Callback = function(value)
+        state.sprinklerMax = value
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Sprinkler Interval (sec)",
+    Range = { 1, 20 },
+    Increment = 1,
+    Suffix = "s",
+    CurrentValue = state.sprinklerInterval,
+    Callback = function(value)
+        state.sprinklerInterval = value
+    end
+})
+
 FarmingTab:CreateSection("Selling")
 
 FarmingTab:CreateToggle({
     Name = "Auto Sell",
-    CurrentValue = false,
+    CurrentValue = state.autoSell,
     Callback = function(value)
         state.autoSell = value
     end
@@ -1154,7 +1839,7 @@ FarmingTab:CreateDropdown({
 
 FarmingTab:CreateToggle({
     Name = "Only Sell When Full",
-    CurrentValue = false,
+    CurrentValue = state.sellOnFull,
     Callback = function(value)
         state.sellOnFull = value
     end
@@ -1182,9 +1867,62 @@ FarmingTab:CreateSlider({
     end
 })
 
+FarmingTab:CreateSection("Sell Keep Rules")
+
+FarmingTab:CreateToggle({
+    Name = "Auto Sell Keep Rules",
+    CurrentValue = state.autoSellKeep,
+    Callback = function(value)
+        state.autoSellKeep = value
+    end
+})
+
+FarmingTab:CreateDropdown({
+    Name = "Keep List",
+    Options = plantTypes,
+    CurrentOption = state.keepList,
+    MultipleOptions = true,
+    Callback = function(options)
+        state.keepList = options
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Keep Amount (Selected)",
+    Range = { 0, 200 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = state.keepAmountSelected,
+    Callback = function(value)
+        state.keepAmountSelected = value
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Keep Amount (Others)",
+    Range = { 0, 200 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = state.keepAmountOthers,
+    Callback = function(value)
+        state.keepAmountOthers = value
+    end
+})
+
+FarmingTab:CreateSlider({
+    Name = "Keep Sell Interval (sec)",
+    Range = { 0.5, 10 },
+    Increment = 0.5,
+    Suffix = "s",
+    CurrentValue = state.keepInterval,
+    Callback = function(value)
+        state.keepInterval = value
+    end
+})
+
 FarmingTab:CreateToggle({
     Name = "Auto Sell By Value",
-    CurrentValue = false,
+    CurrentValue = state.autoSellValue,
     Callback = function(value)
         state.autoSellValue = value
     end
@@ -1215,7 +1953,7 @@ FarmingTab:CreateSlider({
 FarmingTab:CreateButton({
     Name = "Sell All Now",
     Callback = function()
-        safeInvoke(RF_SellItems, "SellAll")
+        performSell("SellAll")
     end
 })
 
@@ -1223,15 +1961,18 @@ ShopTab:CreateSection("Seeds")
 
 ShopTab:CreateToggle({
     Name = "Auto Buy All Seeds",
-    CurrentValue = false,
+    CurrentValue = state.autoBuyAllSeeds,
     Callback = function(value)
         state.autoBuyAllSeeds = value
+        if value then
+            seedBuyIndex = 1
+        end
     end
 })
 
 ShopTab:CreateToggle({
     Name = "Auto Buy Selected Seed",
-    CurrentValue = false,
+    CurrentValue = state.autoBuySeed,
     Callback = function(value)
         state.autoBuySeed = value
     end
@@ -1258,15 +1999,18 @@ ShopTab:CreateSection("Gears")
 
 ShopTab:CreateToggle({
     Name = "Auto Buy All Gears",
-    CurrentValue = false,
+    CurrentValue = state.autoBuyAllGears,
     Callback = function(value)
         state.autoBuyAllGears = value
+        if value then
+            gearBuyIndex = 1
+        end
     end
 })
 
 ShopTab:CreateToggle({
     Name = "Auto Buy Selected Gear",
-    CurrentValue = false,
+    CurrentValue = state.autoBuyGear,
     Callback = function(value)
         state.autoBuyGear = value
     end
@@ -1291,9 +2035,21 @@ ShopTab:CreateButton({
 
 ShopTab:CreateSection("Shop Timing")
 
+ShopTab:CreateToggle({
+    Name = "Buy From Anywhere (No Teleport)",
+    CurrentValue = state.buyFromAnywhere,
+    Callback = function(value)
+        state.buyFromAnywhere = value
+        if value then
+            state.autoTeleportSeedShop = false
+            state.autoTeleportGearShop = false
+        end
+    end
+})
+
 ShopTab:CreateSlider({
     Name = "Buy Delay Between Items (sec)",
-    Range = { 0.05, 2 },
+    Range = { 0.1, 2 },
     Increment = 0.05,
     Suffix = "s",
     CurrentValue = state.buyDelay,
@@ -1303,9 +2059,9 @@ ShopTab:CreateSlider({
 })
 
 ShopTab:CreateSlider({
-    Name = "Auto Buy Loop Interval (sec)",
-    Range = { 5, 300 },
-    Increment = 5,
+    Name = "Selected Buy Interval (sec)",
+    Range = { 0.1, 5 },
+    Increment = 0.05,
     Suffix = "s",
     CurrentValue = state.buyInterval,
     Callback = function(value)
@@ -1338,7 +2094,7 @@ InventoryTab:CreateButton({
 
 InventoryTab:CreateToggle({
     Name = "Auto Merge Backpack",
-    CurrentValue = false,
+    CurrentValue = state.autoMerge,
     Callback = function(value)
         state.autoMerge = value
     end
@@ -1361,7 +2117,7 @@ QuestTab:CreateSection("Quest Automation")
 
 QuestTab:CreateToggle({
     Name = "Auto Quest (Daily + Weekly)",
-    CurrentValue = false,
+    CurrentValue = state.autoQuest,
     Callback = function(value)
         state.autoQuest = value
         if value then
@@ -1372,7 +2128,7 @@ QuestTab:CreateToggle({
 
 QuestTab:CreateToggle({
     Name = "Include Daily",
-    CurrentValue = true,
+    CurrentValue = state.questDaily,
     Callback = function(value)
         state.questDaily = value
     end
@@ -1380,15 +2136,25 @@ QuestTab:CreateToggle({
 
 QuestTab:CreateToggle({
     Name = "Include Weekly",
-    CurrentValue = true,
+    CurrentValue = state.questWeekly,
     Callback = function(value)
         state.questWeekly = value
     end
 })
 
+QuestTab:CreateDropdown({
+    Name = "Quest Priority",
+    Options = { "DailyFirst", "WeeklyFirst", "RoundRobin" },
+    CurrentOption = state.questPriority,
+    MultipleOptions = false,
+    Callback = function(option)
+        state.questPriority = option
+    end
+})
+
 QuestTab:CreateToggle({
     Name = "Allow Auto Sell (Shillings Quest)",
-    CurrentValue = false,
+    CurrentValue = state.questAllowSell,
     Callback = function(value)
         state.questAllowSell = value
     end
@@ -1396,9 +2162,47 @@ QuestTab:CreateToggle({
 
 QuestTab:CreateToggle({
     Name = "Auto Teleport For Quests",
-    CurrentValue = true,
+    CurrentValue = state.questAutoTeleport,
     Callback = function(value)
         state.questAutoTeleport = value
+    end
+})
+
+QuestTab:CreateToggle({
+    Name = "Quest Restock Pin",
+    CurrentValue = state.questRestockPin,
+    Callback = function(value)
+        setQuestRestockPin(value)
+    end
+})
+
+QuestTab:CreateToggle({
+    Name = "Auto Refresh Unsupported",
+    CurrentValue = state.questRefresh,
+    Callback = function(value)
+        state.questRefresh = value
+    end
+})
+
+QuestTab:CreateSlider({
+    Name = "Refresh Max Price",
+    Range = { 0, 500000 },
+    Increment = 5000,
+    Suffix = "",
+    CurrentValue = state.questRefreshMaxPrice,
+    Callback = function(value)
+        state.questRefreshMaxPrice = value
+    end
+})
+
+QuestTab:CreateSlider({
+    Name = "Refresh Min Shillings",
+    Range = { 0, 1000000 },
+    Increment = 5000,
+    Suffix = "",
+    CurrentValue = state.questRefreshMinShillings,
+    Callback = function(value)
+        state.questRefreshMinShillings = value
     end
 })
 
@@ -1410,6 +2214,17 @@ QuestTab:CreateSlider({
     CurrentValue = state.questInterval,
     Callback = function(value)
         state.questInterval = value
+    end
+})
+
+QuestTab:CreateSlider({
+    Name = "Quest Claim Interval (sec)",
+    Range = { 0.5, 10 },
+    Increment = 0.5,
+    Suffix = "s",
+    CurrentValue = state.questClaimInterval,
+    Callback = function(value)
+        state.questClaimInterval = value
     end
 })
 
@@ -1470,9 +2285,46 @@ SettingsTab:CreateToggle({
 
 SettingsTab:CreateToggle({
     Name = "Auto Claim Softlock Cash",
-    CurrentValue = false,
+    CurrentValue = state.autoClaimCash,
     Callback = function(value)
         state.autoClaimCash = value
+    end
+})
+
+SettingsTab:CreateSection("Auto Teleport")
+
+SettingsTab:CreateToggle({
+    Name = "Teleport For Seed Shop",
+    CurrentValue = state.autoTeleportSeedShop,
+    Callback = function(value)
+        state.autoTeleportSeedShop = value
+    end
+})
+
+SettingsTab:CreateToggle({
+    Name = "Teleport For Gear Shop",
+    CurrentValue = state.autoTeleportGearShop,
+    Callback = function(value)
+        state.autoTeleportGearShop = value
+    end
+})
+
+SettingsTab:CreateToggle({
+    Name = "Teleport For Sell Shop",
+    CurrentValue = state.autoTeleportSellShop,
+    Callback = function(value)
+        state.autoTeleportSellShop = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Teleport Cooldown (sec)",
+    Range = { 0.2, 6 },
+    Increment = 0.1,
+    Suffix = "s",
+    CurrentValue = state.teleportCooldown,
+    Callback = function(value)
+        state.teleportCooldown = value
     end
 })
 
@@ -1516,6 +2368,87 @@ SettingsTab:CreateParagraph({
     Content = "Auto Plant uses your plot PlantableArea. If planting fails, increase spacing or wait for plot updates."
 })
 
+SettingsTab:CreateSection("Alerts")
+
+SettingsTab:CreateToggle({
+    Name = "Track Mutations/Giants",
+    CurrentValue = state.alertSpecial,
+    Callback = function(value)
+        state.alertSpecial = value
+    end
+})
+
+SettingsTab:CreateToggle({
+    Name = "Notify On New",
+    CurrentValue = state.alertNotify,
+    Callback = function(value)
+        state.alertNotify = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Alert Interval (sec)",
+    Range = { 2, 30 },
+    Increment = 1,
+    Suffix = "s",
+    CurrentValue = state.alertInterval,
+    Callback = function(value)
+        state.alertInterval = value
+    end
+})
+
+local alertLabel = SettingsTab:CreateLabel("Mutations: 0 | Giants: 0")
+
+SettingsTab:CreateSection("Config")
+
+SettingsTab:CreateToggle({
+    Name = "Auto Save Config",
+    CurrentValue = state.autoSaveConfig,
+    Callback = function(value)
+        state.autoSaveConfig = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Auto Save Interval (sec)",
+    Range = { 5, 120 },
+    Increment = 1,
+    Suffix = "s",
+    CurrentValue = state.autoSaveInterval,
+    Callback = function(value)
+        state.autoSaveInterval = value
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "Save Config Now",
+    Callback = function()
+        local ok, err = saveConfig()
+        if ok then
+            safeNotify("Config", "Saved successfully.")
+        else
+            safeNotify("Config", "Save failed: " .. tostring(err), 6)
+        end
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "Load Config Now",
+    Callback = function()
+        local ok, err = loadConfig()
+        if ok then
+            refreshPlantPositions()
+            refreshSprinklerPositions()
+            if state.autoQuest then
+                requestQuests()
+            end
+            safeNotify("Config", "Loaded.")
+        else
+            safeNotify("Config", "Load failed: " .. tostring(err), 6)
+        end
+    end
+})
+
 -- Loops
 
 task.spawn(function()
@@ -1537,20 +2470,14 @@ task.spawn(function()
         if state.autoPlant then
             local plantType = getActivePlantType()
             if plantType and hasSeedForPlantType(plantType) then
-                if #plantPositions == 0 then
-                    refreshPlantPositions()
-                end
-                local pos = nextPlantPosition()
+                local pos = getNextAutoPlantPosition(state.autoTeleportGardenForPlant)
                 if pos then
                     safeInvoke(RF_PlantSeed, plantType, pos)
                 end
             else
                 local shopItem = getShopItemForPlantType(plantType)
                 if shopItem and state.autoBuyPlantSeed then
-                    local price = seedShopPrices[shopItem]
-                    if canBuy(price) then
-                        safeInvoke(RF_PurchaseShopItem, "SeedShop", shopItem)
-                    end
+                    purchaseSeedShopItem(shopItem)
                 end
             end
         end
@@ -1562,7 +2489,7 @@ task.spawn(function()
     while state.running do
         if state.autoSell then
             if not state.sellOnFull or getToolCount() >= state.sellThreshold then
-                safeInvoke(RF_SellItems, state.sellMode)
+                performSell(state.sellMode)
             end
         end
         task.wait(state.sellInterval)
@@ -1572,22 +2499,28 @@ end)
 task.spawn(function()
     while state.running do
         if state.autoBuyAllSeeds then
-            buyAllSeedsOnce()
+            buyNextSeedInOrder()
+            task.wait(math.max(0.1, state.buyDelay))
         elseif state.autoBuySeed then
             buySelectedSeedOnce()
+            task.wait(math.max(0.1, state.buyInterval))
+        else
+            task.wait(0.1)
         end
-        task.wait(state.buyInterval)
     end
 end)
 
 task.spawn(function()
     while state.running do
         if state.autoBuyAllGears then
-            buyAllGearsOnce()
+            buyNextGearInOrder()
+            task.wait(math.max(0.1, state.buyDelay))
         elseif state.autoBuyGear then
             buySelectedGearOnce()
+            task.wait(math.max(0.1, state.buyInterval))
+        else
+            task.wait(0.1)
         end
-        task.wait(state.buyInterval)
     end
 end)
 
@@ -1658,10 +2591,59 @@ task.spawn(function()
             if tool then
                 equipTool(tool)
                 task.wait(0.05)
-                safeInvoke(RF_SellItems, "SellSingle")
+                performSell("SellSingle")
             end
         end
         task.wait(state.sellValueInterval)
+    end
+end)
+
+task.spawn(function()
+    while state.running do
+        if state.autoSellKeep then
+            local counts = buildToolCounts()
+            for _, tool in ipairs(collectTools()) do
+                if tool:IsA("Tool") and isHarvestItem(tool) then
+                    local base = getToolBaseName(tool)
+                    local keepLimit = getKeepLimit(base)
+                    local count = counts[base] or 0
+                    if count > keepLimit then
+                        equipTool(tool)
+                        task.wait(0.05)
+                        performSell("SellSingle")
+                        counts[base] = count - 1
+                        break
+                    end
+                end
+            end
+        end
+        task.wait(state.keepInterval)
+    end
+end)
+
+task.spawn(function()
+    while state.running do
+        if state.autoSprinkler then
+            if countSprinklers() < state.sprinklerMax then
+                if state.sprinklerAutoTeleport then
+                    teleportToGarden()
+                end
+                local tool, equipped = findToolByName(state.sprinklerType)
+                if tool then
+                    if not equipped then
+                        equipTool(tool)
+                    end
+                    if #sprinklerPositions == 0 then
+                        refreshSprinklerPositions()
+                    end
+                    local pos = nextSprinklerPosition()
+                    if pos then
+                        safeFire(RE_UseGear, tool, { position = pos })
+                    end
+                end
+            end
+        end
+        task.wait(state.sprinklerInterval)
     end
 end)
 
@@ -1695,6 +2677,58 @@ end)
 
 task.spawn(function()
     while state.running do
+        if state.autoSaveConfig then
+            saveConfig()
+        end
+        task.wait(math.max(5, state.autoSaveInterval))
+    end
+end)
+
+task.spawn(function()
+    while state.running do
+        if state.alertSpecial then
+            local mutations, giants = countSpecialPlants()
+            if alertLabel then
+                alertLabel:Set(string.format("Mutations: %d | Giants: %d", mutations, giants))
+            end
+            if state.alertNotify then
+                if mutations > state.lastMutationCount then
+                    if Rayfield and Rayfield.Notify then
+                        Rayfield:Notify({
+                            Title = "Mutation Found",
+                            Content = "Mutations: " .. tostring(mutations),
+                            Duration = 4
+                        })
+                    end
+                end
+                if giants > state.lastGiantCount then
+                    if Rayfield and Rayfield.Notify then
+                        Rayfield:Notify({
+                            Title = "Giant Found",
+                            Content = "Giants: " .. tostring(giants),
+                            Duration = 4
+                        })
+                    end
+                end
+            end
+            state.lastMutationCount = mutations
+            state.lastGiantCount = giants
+        end
+        task.wait(state.alertInterval)
+    end
+end)
+
+task.spawn(function()
+    while state.running do
+        if state.autoQuest then
+            claimCompletedQuests()
+        end
+        task.wait(state.questClaimInterval)
+    end
+end)
+
+task.spawn(function()
+    while state.running do
         if state.autoQuest then
             if not questData or (os.clock() - lastQuestRequest > 30) then
                 requestQuests()
@@ -1706,6 +2740,24 @@ task.spawn(function()
                 state.questTargetCategory = category
                 state.questTargetSlot = slot
                 questStatus:Set(string.format("Target: %s %s (%s) %d/%d", category, tostring(slot), tostring(quest.Type), quest.Progress or 0, quest.Goal or 0))
+                if state.questRefresh then
+                    local unsupported = not questSupported(quest)
+                    if quest.Type == "PlantSeeds" and not questSeedInShop(quest.Item) then
+                        unsupported = true
+                    end
+                    if unsupported then
+                        local resets = 0
+                        if questData and questData[category] and questData[category].ResetCounts then
+                            resets = questData[category].ResetCounts[tostring(slot)] or 0
+                        end
+                        local price = getQuestRefreshPrice(category, resets)
+                        local shillings = getShillings()
+                        if price <= state.questRefreshMaxPrice and shillings >= price and shillings >= state.questRefreshMinShillings then
+                            safeFire(RE_PurchaseQuestRefresh, category, tostring(slot))
+                            task.delay(0.5, requestQuests)
+                        end
+                    end
+                end
             else
                 state.questTargetType = nil
                 state.questTargetItem = nil
@@ -1729,10 +2781,10 @@ task.spawn(function()
         if state.autoQuest and state.questTargetType == "PlantSeeds" and state.questTargetItem then
             local plantType = state.questTargetItem
             if hasSeedForPlantType(plantType) then
-                if #plantPositions == 0 then
-                    refreshPlantPositions()
+                if state.questAutoTeleport then
+                    ensureTeleported("garden")
                 end
-                local pos = nextPlantPosition()
+                local pos = getNextAutoPlantPosition(state.questAutoTeleport)
                 if pos then
                     safeInvoke(RF_PlantSeed, plantType, pos)
                 end
@@ -1740,13 +2792,7 @@ task.spawn(function()
                 local shopItem = getShopItemForPlantType(plantType)
                 if shopItem and (os.clock() - lastQuestBuy > state.questBuyInterval) then
                     lastQuestBuy = os.clock()
-                    if state.questAutoTeleport then
-                        teleportToSeeds()
-                    end
-                    local price = seedShopPrices[shopItem]
-                    if canBuy(price) then
-                        safeInvoke(RF_PurchaseShopItem, "SeedShop", shopItem)
-                    end
+                    purchaseSeedShopItem(shopItem)
                 end
             end
         end
@@ -1757,6 +2803,9 @@ end)
 task.spawn(function()
     while state.running do
         if state.autoQuest and state.questTargetType == "HarvestCrops" and state.questTargetItem then
+            if state.questAutoTeleport then
+                ensureTeleported("garden")
+            end
             local targets = collectHarvestTargets(state.questTargetItem)
             if #targets > 0 and getToolCount() < state.inventoryLimit then
                 safeFire(RE_HarvestFruit, targets)
@@ -1782,13 +2831,13 @@ task.spawn(function()
                 end
             else
                 if state.questAutoTeleport then
-                    teleportToSell()
+                    ensureTeleported("garden")
                 end
                 local targets = collectHarvestTargets(nil)
                 if #targets > 0 and getToolCount() < state.inventoryLimit then
                     safeFire(RE_HarvestFruit, targets)
                 end
-                safeInvoke(RF_SellItems, "SellAll")
+                performSell("SellAll")
             end
         end
         task.wait(math.max(1, state.questHarvestInterval))
