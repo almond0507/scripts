@@ -69,15 +69,23 @@ local DefaultTheme = {
 
 local function Create(className, properties, children)
     local inst = Instance.new(className)
+    local assignParent
     if properties then
         for key, value in pairs(properties) do
-            inst[key] = value
+            if key == "Parent" then
+                assignParent = value
+            else
+                inst[key] = value
+            end
         end
     end
     if children then
         for _, child in ipairs(children) do
             child.Parent = inst
         end
+    end
+    if assignParent then
+        inst.Parent = assignParent
     end
     return inst
 end
@@ -192,7 +200,7 @@ local function MakeDraggable(dragTarget, dragHandle)
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(input)
+    local conn = UserInputService.InputChanged:Connect(function(input)
         if not dragging then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -205,6 +213,7 @@ local function MakeDraggable(dragTarget, dragHandle)
             }, 0.06, Enum.EasingStyle.Quad)
         end
     end)
+    return conn
 end
 
 local Window = {}
@@ -222,13 +231,14 @@ function AlmondGUI:CreateWindow(config)
     local theme = setmetatable(config.Theme or {}, { __index = DefaultTheme })
 
     local self = setmetatable({}, Window)
-    self._theme     = theme
-    self._tabs      = {}
-    self._activeTab = nil
-    self._minimized = false
-    self._visible   = true
-    self._title     = title
-    self._icon      = icon
+    self._theme       = theme
+    self._tabs        = {}
+    self._activeTab   = nil
+    self._minimized   = false
+    self._visible     = true
+    self._title       = title
+    self._icon        = icon
+    self._connections = {}
 
     local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
@@ -332,7 +342,7 @@ function AlmondGUI:CreateWindow(config)
         Tween(minimizeBtn, { BackgroundTransparency = 0.5, BackgroundColor3 = theme.Surface }, theme.TweenSpeedFast)
     end)
 
-    MakeDraggable(self._mainFrame, self._titleBar)
+    table.insert(self._connections, MakeDraggable(self._mainFrame, self._titleBar))
 
     local body = Create("Frame", {
         Name                   = "Body",
@@ -399,7 +409,7 @@ function AlmondGUI:CreateWindow(config)
         AnchorPoint            = Vector2.new(0.5, 0.5),
         BackgroundColor3       = theme.MiniIconBg,
         BackgroundTransparency = 0.15,
-        Text                   = "🌰",
+        Text                   = icon,
         TextSize               = 14,
         Font                   = Enum.Font.SourceSans,
         TextColor3             = theme.Text,
@@ -424,7 +434,7 @@ function AlmondGUI:CreateWindow(config)
         }, theme.TweenSpeedFast)
     end)
 
-    MakeDraggable(self._miniIcon, self._miniIcon)
+    table.insert(self._connections, MakeDraggable(self._miniIcon, self._miniIcon))
 
     self._miniIcon.MouseButton1Click:Connect(function()
         self:Restore()
@@ -712,6 +722,12 @@ function Window:IsVisible()
 end
 
 function Window:Destroy()
+    for _, conn in ipairs(self._connections) do
+        if conn.Connected then
+            conn:Disconnect()
+        end
+    end
+    self._connections = {}
     self._screenGui:Destroy()
     self._tabs = {}
     self._activeTab = nil
@@ -744,7 +760,8 @@ function Window:Notify(config)
     Corner(notif, theme.CornerSmall)
     Stroke(notif, accentColor, 1)
 
-    Create("Frame", {
+    local accentBar = Create("Frame", {
+        Name             = "AccentBar",
         Size             = UDim2.new(0, 3, 1, -16),
         Position         = UDim2.new(0, 8, 0.5, 0),
         AnchorPoint      = Vector2.new(0, 0.5),
@@ -752,7 +769,7 @@ function Window:Notify(config)
         BorderSizePixel  = 0,
         Parent           = notif,
     })
-    Corner(notif:FindFirstChild("Frame") or notif:GetChildren()[#notif:GetChildren()], DefaultTheme.CornerPill)
+    Corner(accentBar, DefaultTheme.CornerPill)
 
     Create("TextLabel", {
         Size                   = UDim2.new(1, -30, 0, 20),
@@ -1041,6 +1058,8 @@ function Tab:AddSlider(config)
         return string.format("%." .. decimals .. "f", val)
     end
 
+    valueLabel.Text = formatValue(default) .. suffix
+
     local function setValue(val)
         val = math.clamp(val, min, max)
         if increment > 0 then
@@ -1082,7 +1101,7 @@ function Tab:AddSlider(config)
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(input)
+    local sliderConn = UserInputService.InputChanged:Connect(function(input)
         if not dragging then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -1093,6 +1112,7 @@ function Tab:AddSlider(config)
             setValue(min + p * (max - min))
         end
     end)
+    table.insert(self._window._connections, sliderConn)
 
     container.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseMovement then
@@ -1276,13 +1296,13 @@ function Tab:AddDropdown(config)
         BackgroundColor3 = theme.Surface,
         BorderSizePixel  = 0,
         LayoutOrder      = self._layoutOrder,
-        ClipsDescendants = false,
+        ClipsDescendants = true,
         Parent           = self._content,
     })
     Corner(container, theme.CornerSmall)
 
     Create("TextLabel", {
-        Size                   = UDim2.new(0.5, -12, 1, 0),
+        Size                   = UDim2.new(0.5, -12, 0, theme.ControlHeight),
         Position               = UDim2.new(0, 12, 0, 0),
         BackgroundTransparency = 1,
         Text                   = name,
@@ -1294,7 +1314,7 @@ function Tab:AddDropdown(config)
     })
 
     local selectedLabel = Create("TextLabel", {
-        Size                   = UDim2.new(0.5, -36, 1, 0),
+        Size                   = UDim2.new(0.5, -36, 0, theme.ControlHeight),
         Position               = UDim2.new(0.5, 0, 0, 0),
         BackgroundTransparency = 1,
         Text                   = selected,
@@ -1307,7 +1327,7 @@ function Tab:AddDropdown(config)
     })
 
     local arrow = Create("TextLabel", {
-        Size                   = UDim2.new(0, 20, 1, 0),
+        Size                   = UDim2.new(0, 20, 0, theme.ControlHeight),
         Position               = UDim2.new(1, -24, 0, 0),
         BackgroundTransparency = 1,
         Text                   = "▾",
@@ -1320,7 +1340,7 @@ function Tab:AddDropdown(config)
     local dropdownList = Create("Frame", {
         Name                   = "DropdownList",
         Size                   = UDim2.new(1, 0, 0, 0),
-        Position               = UDim2.new(0, 0, 1, 4),
+        Position               = UDim2.fromOffset(0, theme.ControlHeight + 4),
         BackgroundColor3       = theme.DropdownBg,
         BorderSizePixel        = 0,
         ClipsDescendants       = true,
@@ -1348,6 +1368,7 @@ function Tab:AddDropdown(config)
         isOpen = false
         arrow.Text = "▾"
         Tween(dropdownList, { Size = UDim2.new(1, 0, 0, 0) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+        Tween(container, { Size = UDim2.new(1, 0, 0, theme.ControlHeight) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         task.delay(0.2, function()
             if not isOpen then
                 dropdownList.Visible = false
@@ -1363,6 +1384,7 @@ function Tab:AddDropdown(config)
         dropdownList.Size = UDim2.new(1, 0, 0, 0)
         local targetH = math.min(#options * 30 + 8, 200)
         Tween(dropdownList, { Size = UDim2.new(1, 0, 0, targetH) }, 0.2, Enum.EasingStyle.Quad)
+        Tween(container, { Size = UDim2.new(1, 0, 0, theme.ControlHeight + 4 + targetH) }, 0.2, Enum.EasingStyle.Quad)
     end
 
     local function buildOptions()
@@ -1415,7 +1437,7 @@ function Tab:AddDropdown(config)
     buildOptions()
 
     local toggleBtn = Create("TextButton", {
-        Size                   = UDim2.new(1, 0, 1, 0),
+        Size                   = UDim2.new(1, 0, 0, theme.ControlHeight),
         BackgroundTransparency = 1,
         Text                   = "",
         ZIndex                 = 2,
@@ -1511,6 +1533,14 @@ function Tab:AddKeybind(config)
         local conn
         conn = UserInputService.InputBegan:Connect(function(input, processed)
             if input.UserInputType == Enum.UserInputType.Keyboard then
+                if input.KeyCode == Enum.KeyCode.Escape then
+                    keyBtn.Text = currentKey.Name
+                    Tween(keyBtn, { BackgroundColor3 = theme.InputBackground }, 0.15)
+                    Tween(keyBtn, { TextColor3 = theme.Accent }, 0.15)
+                    listening = false
+                    conn:Disconnect()
+                    return
+                end
                 currentKey = input.KeyCode
                 keyBtn.Text = input.KeyCode.Name
                 Tween(keyBtn, { BackgroundColor3 = theme.InputBackground }, 0.15)
@@ -1521,12 +1551,13 @@ function Tab:AddKeybind(config)
         end)
     end)
 
-    UserInputService.InputBegan:Connect(function(input, processed)
+    local keybindConn = UserInputService.InputBegan:Connect(function(input, processed)
         if processed or listening then return end
         if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == currentKey then
             callback(currentKey)
         end
     end)
+    table.insert(self._window._connections, keybindConn)
 
     keyBtn.MouseEnter:Connect(function()
         if not listening then
