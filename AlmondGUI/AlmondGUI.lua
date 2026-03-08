@@ -1330,9 +1330,9 @@ function Tab:AddDropdown(config)
         Size                   = UDim2.new(0, 20, 0, theme.ControlHeight),
         Position               = UDim2.new(1, -24, 0, 0),
         BackgroundTransparency = 1,
-        Text                   = "▾",
-        TextSize               = 14,
-        Font                   = theme.Font,
+        Text                   = "v",
+        TextSize               = 16,
+        Font                   = theme.FontBold,
         TextColor3             = theme.TextSecondary,
         Parent                 = container,
     })
@@ -1366,6 +1366,8 @@ function Tab:AddDropdown(config)
     local function closeDropdown()
         if not isOpen then return end
         isOpen = false
+        arrow.Text = "v"
+
         Tween(dropdownList, { Size = UDim2.new(1, 0, 0, 0) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         Tween(container, { Size = UDim2.new(1, 0, 0, theme.ControlHeight) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         task.delay(0.2, function()
@@ -1378,6 +1380,7 @@ function Tab:AddDropdown(config)
     local function openDropdown()
         if isOpen then return end
         isOpen = true
+        arrow.Text = "^"
         dropdownList.Visible = true
         dropdownList.Size = UDim2.new(1, 0, 0, 0)
         local targetH = math.min(#options * 30 + 8, 200)
