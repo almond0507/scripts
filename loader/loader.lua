@@ -8,6 +8,10 @@ local Games = {
         name   = "Almond Hub | Untitled Melee RNG",
         script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/UMR.lua",
     },
+    [114640202062357] = {
+        name   = "Almond Hub | Swing For Brainrot",
+        script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/SFB.lua",
+    },
 }
 
 local placeId = game.PlaceId
