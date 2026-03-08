@@ -1366,7 +1366,7 @@ function Tab:AddDropdown(config)
     local function closeDropdown()
         if not isOpen then return end
         isOpen = false
-        arrow.Text = "▼"
+        arrow.Text = "🇻"
         Tween(dropdownList, { Size = UDim2.new(1, 0, 0, 0) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         Tween(container, { Size = UDim2.new(1, 0, 0, theme.ControlHeight) }, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         task.delay(0.2, function()
@@ -1379,7 +1379,7 @@ function Tab:AddDropdown(config)
     local function openDropdown()
         if isOpen then return end
         isOpen = true
-        arrow.Text = "▲"
+        arrow.Text = "Λ"
         dropdownList.Visible = true
         dropdownList.Size = UDim2.new(1, 0, 0, 0)
         local targetH = math.min(#options * 30 + 8, 200)
