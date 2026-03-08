@@ -1,6 +1,6 @@
 repeat task.wait(1) until game:IsLoaded()
 
-local DISCORD = "https://discord.gg/36Pf7W5hgd"
+local GSP = "https://github.com/kelliark/test/blob/main/scripts/README.md"
 local KEYSYS_URL = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/loader/keysys.lua"
 
 local Games = {
@@ -22,7 +22,7 @@ end
 
 if not config then
     game:GetService("Players").LocalPlayer:Kick(
-        "Game Not Supported!\n\nVisit " .. DISCORD .. " to see what games are supported."
+        "Game Not Supported!\n\nVisit " .. GSP .. " to see what games are supported."
     )
     return
 end
