@@ -12,6 +12,10 @@ local Games = {
         name   = "Almond Hub | Swing For Brainrot",
         script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/SFB.lua",
     },
+    [74277864669743] = {
+        name   = "Almond Hub | Fly For Brainrots",
+        script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/FFB.lua",
+    },
 }
 
 local placeId = game.PlaceId
