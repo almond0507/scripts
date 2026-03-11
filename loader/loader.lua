@@ -1,6 +1,6 @@
 repeat task.wait(1) until game:IsLoaded()
 
-local GSP = "https://github.com/kelliark/test/blob/main/scripts/README.md"
+local GSP = "https://pastebin.com/u/kelliark"
 local KEYSYS_URL = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/loader/keysys.lua"
 
 local Games = {
