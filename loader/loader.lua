@@ -20,6 +20,10 @@ local Games = {
         name   = "Almond Hub | Jump to steal lucky blocks",
         script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/JTSLB.lua",
     },
+    [124473577469410] = {
+        name   = "Almond Hub | Be a lucky block",
+        script = "https://raw.githubusercontent.com/almond0507/scripts/refs/heads/main/UntitledMeleeRNG/BALB.lua",
+    },
 }
 
 local placeId = game.PlaceId
